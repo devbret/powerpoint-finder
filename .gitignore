@@ -1,0 +1,5 @@
+manifests/
+powerpoint_downloads/*.ppt
+powerpoint_downloads/*.pptx
+venv/
+.env
