@@ -8,6 +8,7 @@ import hashlib
 import logging
 import argparse
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -206,7 +207,7 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_session(user_agent: str) -> Session:
+def build_session(user_agent: str, pool_size: int = 10) -> Session:
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent})
 
@@ -220,7 +221,11 @@ def build_session(user_agent: str) -> Session:
         raise_on_status=False,
     )
 
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+    )
 
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -390,6 +395,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of concurrent download workers.",
+    )
+
+    parser.add_argument(
         "--out-dir",
         default=None,
         help="Directory where downloaded PowerPoint files are stored.",
@@ -463,6 +475,7 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
     pages = args.pages if args.pages is not None else _int_env("PAGES", 10)
     delay = args.delay if args.delay is not None else _float_env("DELAY", 0.0)
     timeout = args.timeout if args.timeout is not None else _int_env("TIMEOUT", 60)
+    workers = max(1, args.workers if args.workers is not None else _int_env("WORKERS", 4))
 
     api_endpoint = (
         args.api_endpoint
@@ -507,6 +520,7 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         "PAGES": pages,
         "DELAY": delay,
         "TIMEOUT": timeout,
+        "WORKERS": workers,
         "DRY_RUN": args.dry_run,
     }
 
@@ -903,6 +917,77 @@ def download_powerpoint(
         }
 
 
+def process_result_item(
+    session: Session,
+    logger: logging.Logger,
+    config: Dict[str, Any],
+    item: SearchResult,
+    index: int,
+    total: int,
+) -> None:
+    print(f"[{index}/{total}] Downloading: {item.link}")
+    logger.info(
+        "Preparing to download %d/%d: %s",
+        index,
+        total,
+        item.link,
+    )
+
+    if is_blocked_domain(item.link, config["BLOCKED_DOWNLOAD_DOMAINS"]):
+        blocked_host = extract_hostname(item.link)
+
+        item.status = "skipped"
+        item.error = f"Blocked domain: {blocked_host}"
+        item.downloaded_at = utc_now_iso()
+
+        logger.info(
+            "Skipped blocked domain: url=%s hostname=%s",
+            item.link,
+            blocked_host,
+        )
+
+        return
+
+    ok, info = download_powerpoint(
+        session=session,
+        logger=logger,
+        out_dir=config["OUT_DIR"],
+        timeout=config["TIMEOUT"],
+        url=item.link,
+        title_hint=item.title,
+        expected_extension=item.extension,
+    )
+
+    item.http_status = info.get("http_status")
+    item.content_type = info.get("content_type", "")
+    item.content_length = info.get("content_length")
+    item.final_url = info.get("final_url", "")
+    item.detected_type = info.get("detected_type", "")
+    item.is_valid_powerpoint = bool(info.get("is_valid_powerpoint", False))
+    item.sha256 = info.get("sha256", "")
+    item.downloaded_at = utc_now_iso()
+
+    if ok:
+        item.status = "downloaded"
+        item.saved_as = info.get("saved_as", "")
+
+        logger.info(
+            "Marked as downloaded: url=%s saved_as=%s",
+            item.link,
+            item.saved_as,
+        )
+
+    else:
+        item.status = "skipped"
+        item.error = info.get("error", "")
+
+        logger.info(
+            "Marked as skipped: url=%s reason=%s",
+            item.link,
+            item.error,
+        )
+
+
 def save_manifest(
     manifest_dir: Path,
     logger: logging.Logger,
@@ -982,7 +1067,10 @@ def main() -> None:
     config = load_config(args)
 
     logger = setup_logger(config["LOG_PATH"])
-    session = build_session(config["USER_AGENT"])
+    session = build_session(
+        config["USER_AGENT"],
+        pool_size=max(10, config["WORKERS"]),
+    )
 
     logger.info("=== Run started ===")
     logger.info("Queries: %s", config["QUERIES"])
@@ -991,6 +1079,7 @@ def main() -> None:
     logger.info("Output directory: %s", config["OUT_DIR"].resolve())
     logger.info("Manifest directory: %s", config["MANIFEST_DIR"].resolve())
     logger.info("Log file: %s", config["LOG_PATH"].resolve())
+    logger.info("Download workers: %d", config["WORKERS"])
     logger.info("Dry run: %s", config["DRY_RUN"])
 
     all_results: List[SearchResult] = []
@@ -1026,68 +1115,35 @@ def main() -> None:
     logger.info("Total unique links after dedupe: %d", len(all_results))
 
     if not config["DRY_RUN"]:
-        for i, item in enumerate(all_results, start=1):
-            print(f"[{i}/{len(all_results)}] Downloading: {item.link}")
-            logger.info(
-                "Preparing to download %d/%d: %s",
-                i,
-                len(all_results),
-                item.link,
-            )
+        with ThreadPoolExecutor(max_workers=config["WORKERS"]) as executor:
+            futures = {
+                executor.submit(
+                    process_result_item,
+                    session,
+                    logger,
+                    config,
+                    item,
+                    i,
+                    len(all_results),
+                ): item
+                for i, item in enumerate(all_results, start=1)
+            }
 
-            if is_blocked_domain(item.link, config["BLOCKED_DOWNLOAD_DOMAINS"]):
-                blocked_host = extract_hostname(item.link)
+            for future in as_completed(futures):
+                item = futures[future]
 
-                item.status = "skipped"
-                item.error = f"Blocked domain: {blocked_host}"
-                item.downloaded_at = utc_now_iso()
+                try:
+                    future.result()
+                except Exception as exc:
+                    item.status = "skipped"
+                    item.error = str(exc)
+                    item.downloaded_at = utc_now_iso()
 
-                logger.info(
-                    "Skipped blocked domain: url=%s hostname=%s",
-                    item.link,
-                    blocked_host,
-                )
-
-                continue
-
-            ok, info = download_powerpoint(
-                session=session,
-                logger=logger,
-                out_dir=config["OUT_DIR"],
-                timeout=config["TIMEOUT"],
-                url=item.link,
-                title_hint=item.title,
-                expected_extension=item.extension,
-            )
-
-            item.http_status = info.get("http_status")
-            item.content_type = info.get("content_type", "")
-            item.content_length = info.get("content_length")
-            item.final_url = info.get("final_url", "")
-            item.detected_type = info.get("detected_type", "")
-            item.is_valid_powerpoint = bool(info.get("is_valid_powerpoint", False))
-            item.sha256 = info.get("sha256", "")
-            item.downloaded_at = utc_now_iso()
-
-            if ok:
-                item.status = "downloaded"
-                item.saved_as = info.get("saved_as", "")
-
-                logger.info(
-                    "Marked as downloaded: url=%s saved_as=%s",
-                    item.link,
-                    item.saved_as,
-                )
-
-            else:
-                item.status = "skipped"
-                item.error = info.get("error", "")
-
-                logger.info(
-                    "Marked as skipped: url=%s reason=%s",
-                    item.link,
-                    item.error,
-                )
+                    logger.error(
+                        "Worker exception for url=%s: %s",
+                        item.link,
+                        exc,
+                    )
 
     else:
         logger.info("Dry run enabled; skipping downloads.")
