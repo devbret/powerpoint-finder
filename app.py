@@ -833,7 +833,11 @@ def download_powerpoint(
                     "saved_as": "",
                 }
 
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                dir=out_dir,
+                prefix=".incomplete-",
+            ) as tmp:
                 tmp_path = Path(tmp.name)
 
                 hasher = hashlib.sha256()
