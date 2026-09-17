@@ -34,7 +34,7 @@ Below are the required software programs and initial steps for running this appl
 
 7. Install the needed dependencies for running the script: `pip install -r requirements.txt`
 
-8. Convert the `.env.template` file into a `.env` file
+8. Convert the `.template.env` file into a `.env` file
 
 9. Add values for environmental variables in the `.env` file
 

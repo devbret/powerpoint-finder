@@ -2,5 +2,6 @@ __pycache__
 manifests/
 powerpoint_downloads/*.ppt
 powerpoint_downloads/*.pptx
+powerpoint_downloads/.incomplete-*
 venv/
 .env
